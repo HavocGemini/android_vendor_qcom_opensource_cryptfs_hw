@@ -45,6 +45,10 @@
 #include "cutils/android_reboot.h"
 #include "cryptfs_hw.h"
 
+#ifdef LEGACY_HW_DISK_ENCRYPTION
+#define QSEECOM_LIBRARY_NAME "libQSEEComAPI.so"
+#endif
+
 /*
  * When device comes up or when user tries to change the password, user can
  * try wrong password upto a certain number of times. If user enters wrong
@@ -59,10 +63,15 @@
 #define SET_HW_DISK_ENC_KEY				1
 #define UPDATE_HW_DISK_ENC_KEY				2
 
-#define CRYPTFS_HW_KMS_CLEAR_KEY			0
+#ifdef LEGACY_HW_DISK_ENCRYPTION
+static int loaded_library = 0;
+static int (*qseecom_create_key)(int, void*);
+static int (*qseecom_update_key)(int, void*, void*);
+static int (*qseecom_wipe_key)(int);
+#endif
+
 #define CRYPTFS_HW_KMS_WIPE_KEY				1
 #define CRYPTFS_HW_UP_CHECK_COUNT			10
-#define CRYPTFS_HW_CLEAR_KEY_FAILED			-11
 #define CRYPTFS_HW_KMS_MAX_FAILURE			-10
 #define CRYPTFS_HW_UPDATE_KEY_FAILED			-9
 #define CRYPTFS_HW_WIPE_KEY_FAILED			-8
@@ -87,6 +96,77 @@ static inline void* secure_memset(void* v, int c , size_t n)
 	return v;
 }
 
+static int is_qseecom_up();
+
+#ifdef LEGACY_HW_DISK_ENCRYPTION
+static int load_qseecom_library()
+{
+    const char *error = NULL;
+    if (loaded_library)
+        return loaded_library;
+
+    if (!is_qseecom_up()) {
+        SLOGE("Timed out waiting for QSEECom listeners. Aborting FDE key operation");
+        return 0;
+    }
+
+    void * handle = dlopen(QSEECOM_LIBRARY_NAME, RTLD_NOW);
+    if (handle) {
+        dlerror(); /* Clear any existing error */
+        *(void **) (&qseecom_create_key) = dlsym(handle, "QSEECom_create_key");
+
+        if ((error = dlerror()) == NULL) {
+            SLOGD("Success loading QSEECom_create_key \n");
+            *(void **) (&qseecom_update_key) = dlsym(handle, "QSEECom_update_key_user_info");
+            if ((error = dlerror()) == NULL) {
+                SLOGD("Success loading QSEECom_update_key_user_info\n");
+                *(void **) (&qseecom_wipe_key) = dlsym(handle, "QSEECom_wipe_key");
+                if ((error = dlerror()) == NULL) {
+                    loaded_library = 1;
+                    SLOGD("Success loading QSEECom_wipe_key \n");
+                }
+                else
+                    SLOGE("Error %s loading symbols for QSEECom APIs \n", error);
+            }
+            else
+                SLOGE("Error %s loading symbols for QSEECom APIs \n", error);
+        }
+    } else {
+        SLOGE("Could not load libQSEEComAPI.so \n");
+    }
+
+    if (error)
+        dlclose(handle);
+
+    return loaded_library;
+}
+
+static int cryptfs_hw_create_key(enum cryptfs_hw_key_management_usage_type usage,
+					unsigned char *hash32)
+{
+	if (load_qseecom_library())
+		return qseecom_create_key(usage, hash32);
+
+	return CRYPTFS_HW_CREATE_KEY_FAILED;
+}
+
+static int cryptfs_hw_wipe_key(enum cryptfs_hw_key_management_usage_type usage)
+{
+	if (load_qseecom_library())
+		return qseecom_wipe_key(usage);
+
+	return CRYPTFS_HW_WIPE_KEY_FAILED;
+}
+
+static int cryptfs_hw_update_key(enum cryptfs_hw_key_management_usage_type usage,
+			unsigned char *current_hash32, unsigned char *new_hash32)
+{
+	if (load_qseecom_library())
+		return qseecom_update_key(usage, current_hash32, new_hash32);
+
+	return CRYPTFS_HW_UPDATE_KEY_FAILED;
+}
+#else
 static size_t memscpy(void *dst, size_t dst_size, const void *src, size_t src_size)
 {
 	size_t min_size = (dst_size < src_size) ? dst_size : src_size;
@@ -191,27 +271,11 @@ int set_ice_param(int flag)
 	return ret;
 }
 #else
-int set_ice_param(int flag)
+int set_ice_param(__unused int flag)
 {
 	return -1;
 }
 #endif
-
-static int cryptfs_hw_clear_key(enum cryptfs_hw_key_management_usage_type usage)
-{
-	int32_t ret;
-
-	ret = __cryptfs_hw_wipe_clear_key(usage, CRYPTFS_HW_KMS_CLEAR_KEY);
-	if (ret) {
-		SLOGE("Error::ioctl call to wipe the encryption key for usage %d failed with ret = %d, errno = %d\n",
-			usage, ret, errno);
-		ret = CRYPTFS_HW_CLEAR_KEY_FAILED;
-	} else {
-		SLOGE("SUCCESS::ioctl call to wipe the encryption key for usage %d success with ret = %d\n",
-			usage, ret);
-	}
-	return ret;
-}
 
 static int cryptfs_hw_update_key(enum cryptfs_hw_key_management_usage_type usage,
 			unsigned char *current_hash32, unsigned char *new_hash32)
@@ -260,6 +324,7 @@ static int cryptfs_hw_update_key(enum cryptfs_hw_key_management_usage_type usage
 	close(qseecom_fd);
 	return ret;
 }
+#endif
 
 static int map_usage(int usage)
 {
@@ -294,19 +359,30 @@ static unsigned char* get_tmp_passwd(const char* passwd)
     return tmp_passwd;
 }
 
-static int is_qseecom_up()
+#ifdef WAIT_FOR_QSEE
+int is_qseecom_up()
 {
     int i = 0;
     char value[PROPERTY_VALUE_MAX] = {0};
 
     for (; i<CRYPTFS_HW_UP_CHECK_COUNT; i++) {
+#ifdef LEGACY_HW_DISK_ENCRYPTION
+        property_get("sys.keymaster.loaded", value, "");
+#else
         property_get("vendor.sys.keymaster.loaded", value, "");
+#endif
         if (!strncmp(value, "true", PROPERTY_VALUE_MAX))
             return 1;
         usleep(100000);
     }
     return 0;
 }
+#else
+int is_qseecom_up()
+{
+    return 1;
+}
+#endif
 
 /*
  * For NON-ICE targets, it would return 0 on success. On ICE based targets,
@@ -365,7 +441,6 @@ int is_ice_enabled(void)
 {
   char prop_storage[PATH_MAX];
   int storage_type = 0;
-  int fd;
 
   /*
    * Since HW FDE is a compile time flag (due to QSSI requirements),
@@ -413,6 +488,17 @@ static int get_keymaster_version()
 
 int should_use_keymaster()
 {
+#ifdef LEGACY_HW_DISK_ENCRYPTION
+    /*
+     * HW FDE key should be tied to keymaster only if
+     * new Keymaster is available
+     */
+    int rc = 0;
+    if (get_keymaster_version() != KEYMASTER_MODULE_API_VERSION_1_0) {
+        SLOGI("Keymaster version is not 1.0");
+        return rc;
+    }
+#else
     /*
      * HW FDE key should be tied to keymaster
      * if version is above 0.3. this is to
@@ -424,4 +510,5 @@ int should_use_keymaster()
         rc = 0;
      }
      return rc;
+#endif
 }
